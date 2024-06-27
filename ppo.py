@@ -1,24 +1,27 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
 import os
 import sys
-sys.path.append("/raid/infolab/veerendra/shariq/workdir")
+sys.path.append(os.getcwd()) # previous: "/raid/infolab/veerendra/shariq/workdir"
 import random
 import time
 from dataclasses import dataclass
-
+print(os.getcwd())  # /home/.../cleanrl/cleanrl => dir where python run command is called
+# sys.exit()
+# file path: /home/.../cleanrl/cleanrl/cleanrl/ppo.py
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchvision import transforms
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
-from catdogmodel import CatAndDogConvNet
+from utils.catdogmodel import CatAndDogConvNet, CatAndDogConvNetCustom
 # from RlvlmfCNNmodel import gen_image_net
-from utils_train_reward_model import prepocess_image
+from utils.utils_train_reward_model import prepocess_image
 import matplotlib.pyplot as plt
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -44,7 +47,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
@@ -56,7 +59,7 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 1 # previous value = 4
     """the number of parallel game environments"""
-    num_steps: int = 128 # previous value: 128
+    num_steps: int = 256 # previous value: 128
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -91,14 +94,18 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
     use_custom_reward: bool = False
+    use_env_reward: bool = False
+    use_designed_reward: bool = False
     record_every: int = 100
+    model_name: str = 'catanddog'
+    model_file_name: str = 'reward_model_catanddog_CartPole_imageSize_224.pth'
 
 
 def make_env(env_id, idx, capture_video, run_name, record_every):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: x % record_every == 0)
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: (x+1) % record_every == 0)
         else:
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -141,25 +148,40 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
+def designed_reward_fun(cart_position, pole_angle):
+    max_distance  = 2.4
+    max_angle     = 0.2095
+    return (max_distance - abs(cart_position)) * (max_angle - abs(pole_angle)) / (max_distance * max_angle)
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{args.use_custom_reward}__with_Env_Rewards__{args.num_steps}__{args.total_timesteps}__{int(time.time())}"
+    run_time = int(time.time())
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__custom_reward_{args.use_custom_reward}_env_rewards_{args.use_env_reward}__{args.num_steps}__{args.total_timesteps}__{run_time}"
 
     # load reward model
-    reward_models_dir = "/raid/infolab/veerendra/shariq/workdir/trained_reward_models/"
+    reward_models_dir = os.path.join(os.getcwd(), 'trained_reward_models')
     env_name_0 = args.env_id.split("-")[0]
-    model_path = os.path.join(reward_models_dir, f"reward_model_catanddog_{env_name_0}.pth")
-    h, w = 224, 224
-    if 'rlvlmf' in model_path:
+
+    if 'rlvlmf' in args.model_file_name:
+        h, w = 224, 224
         reward_model = gen_image_net(image_height=h, image_width=w)
-    else:
+    elif args.model_name == 'catanddog':
         reward_model = CatAndDogConvNet()
+    elif args.model_name == 'CatAndDogConvNetCustom':
+        reward_model = CatAndDogConvNetCustom(image_height=400, image_width=600)
+
+    model_path = os.path.join(reward_models_dir, args.model_file_name)
     reward_model.load_state_dict(torch.load(model_path))
+    reward_model = reward_model.to(device)
     reward_model.eval()
+    num_parameters = sum(p.numel() for p in reward_model.parameters() if p.requires_grad)
+    print(f"Model Name      : {args.model_name}")
+    print(f"Model File Name : {args.model_file_name}")
+    print(f"Num Paramteres  : {num_parameters = }")
+    print(f"custom: {args.use_custom_reward} env: {args.use_env_reward}")
 
     if args.track:
         import wandb
@@ -238,6 +260,7 @@ if __name__ == "__main__":
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
+            state = next_obs[0].tolist()
 
             #################### get reward from custom reward model  ###########################
             img_b = envs.call('render')
@@ -246,8 +269,19 @@ if __name__ == "__main__":
             # plt.imsave(f"{filename}", img)      # (400, 600, 3)
             # preprocess image
             img = Image.fromarray(img)    # (600, 400) pil image
-            img = prepocess_image(img)    # (3,224,224) tensor image
-            # print(f"{img.shape = } -- preprocessed")
+            # img = prepocess_image(img)    # (3,224,224) tensor image
+            ############## to resize (400,600) image to square image dimensions  ##########################
+            if args.model_name == 'catanddog':
+                img = img.resize((500,500))
+                preprocess = transforms.Compose([
+                                transforms.Resize(224),
+                                transforms.ToTensor(),
+                                transforms.Normalize((0.5,), (0.5,))
+                            ])
+                img = preprocess(img)
+            ######################################################################
+            else:
+                img = transforms.ToTensor()(img)
 
             # from torchvision.transforms import ToPILImage
             # img_tmp = img.cpu()
@@ -256,25 +290,32 @@ if __name__ == "__main__":
             # print(f"{pil_image.size = }")
 
             # query reward model
-            # print(f"{reward.shape = }")
-            with torch.no_grad():
-                # img = img.to(device)
-                # custom_reward = -reward_model(img.unsqueeze(0)).view(-1).numpy()
-                custom_reward = torch.nn.Sigmoid()(reward_model(img.unsqueeze(0))).view(-1).numpy() + reward
-                # print(f"output reward model : {custom_reward.shape} {reward_model(img.unsqueeze(0)).view(-1).numpy()} {custom_reward}")
-                # sys.exit()
-
-            #####################################################################################
-
+            # reward.shape = (1,) type(reward) = <class 'numpy.ndarray'>
+            custom_reward = np.array([0.0])
             if args.use_custom_reward:
-                rewards[step] = torch.tensor(custom_reward).to(device).view(-1)  # default: 'reward' instead of 'custom_reward'
-            else:
-                rewards[step] = torch.tensor(reward).to(device).view(-1) # default: 'reward' instead of 'custom_reward'
+                with torch.no_grad():
+                    if 'sigmoid' in args.model_file_name:
+                        custom_reward = (reward_model(img.unsqueeze(0).to(device))).cpu().view(-1).numpy()
+                    else:
+                        custom_reward = torch.nn.Sigmoid()(reward_model(img.unsqueeze(0).to(device))).cpu().view(-1).numpy()
+            
+            env_reward = np.array([0.0])
+            if args.use_env_reward:
+                env_reward = reward 
+            
+            designed_reward = np.array([0.0])
+            if args.use_designed_reward:
+                designed_reward = np.array(designed_reward_fun(state[0], state[2]))
+
+            combined_reward = custom_reward + env_reward 
+            #####################################################################################
+            
+            rewards[step] = torch.tensor(combined_reward).to(device).view(-1) # default: 'reward' instead of 'combined_reward'
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            log_env_rewards.append(reward[0])
-            log_custom_rewards.append(custom_reward[0])
-            episode_rewards.append(custom_reward[0])
+            episode_rewards.append(combined_reward[0])
+            # log_env_rewards.append(reward[0])
+            # log_custom_rewards.append(combined_reward[0])
             # print(reward)
 
             if "final_info" in infos:
@@ -389,10 +430,11 @@ if __name__ == "__main__":
     # Save logs to csv
     import csv
     os.system('mkdir -p summary')
-    with open(f'./summary/{args.env_id}_{args.use_custom_reward}_{args.total_timesteps}_with_env_rewards.csv', 'w', newline='') as file:
-        writer = csv.writer(file)
+    with open(os.path.join(os.getcwd(), f'summary/{args.env_id}_custom_reward_{args.use_custom_reward}_env_rewards_{args.use_env_reward}_{args.total_timesteps}_{run_time}.csv'), 'w', newline='') as file:
+        csv_writer = csv.writer(file)
+        csv_writer.writerow(['env_reward', 'custom_reward'])
         for x, y in zip(log_episodic_returns, log_custom_episode_returns):
-            writer.writerow([x,y])
+            csv_writer.writerow([x,y])
 
     # plot rewards
     import matplotlib.pyplot as plt
@@ -402,6 +444,7 @@ if __name__ == "__main__":
     print(f"{len(x_values) = }")
     print(f"{len(log_episodic_returns) = }")
     print(f"{log_episodic_returns[:5] = }")
+    print(f"{log_custom_episode_returns[:5] = }")
     # plt.plot(x_values, log_env_rewards, label='env_rewards')
     # plt.plot(x_values, log_custom_rewards, label='custom_rewards')
     from scipy.ndimage.filters import gaussian_filter1d
@@ -411,16 +454,24 @@ if __name__ == "__main__":
 
     # Plot the smoothed values
     plt.plot(x_values, smoothed_episodic_returns, label='Env Episodic Returns', color='blue')
-    plt.plot(x_values, smoothed_custom_episode_returns, label='Custom Episodic Returns', color='red')
+    plt.plot(x_values, smoothed_custom_episode_returns, label='Custom Episodic Returns', color='green')
     
     plt.plot(x_values, log_episodic_returns, alpha=0.2, color='blue')
-    plt.plot(x_values, log_custom_episode_returns, alpha=0.2, color='red')
+    plt.plot(x_values, log_custom_episode_returns, alpha=0.2, color='green')
     plt.xlabel('Steps')
     plt.ylabel('Returns')
-    plt.title(f"{args.env_id}")
     plt.legend()
-    plt.savefig(f"rewards_plot_custom_reward_{args.use_custom_reward}_sigmoid_with_env_rewards_{args.total_timesteps}_{args.num_steps}.png")
+    plt.title(f"{args.env_id}  custom: {args.use_custom_reward}, env: {args.use_env_reward}")
+    plt.savefig(f"rewards_plot_custom_reward_{args.use_custom_reward}_env_rewards_{args.use_env_reward}_{args.total_timesteps}_{args.num_steps}_{run_time}.png")
 
     # save model
     os.system('mkdir -p trained_policies')
-    torch.save(agent.state_dict(), f"./trained_policies/Agent_{args.env_id}_{args.use_custom_reward}_{args.total_timesteps}_{int(time.time())}.pth")
+    torch.save(agent.state_dict(), os.path.join(os.getcwd(), f"trained_policies/Agent_{args.env_id}_custom_reward_{args.use_custom_reward}_env_rewards_{args.use_env_reward}_{args.total_timesteps}_{run_time}.pth"))
+
+'''
+python ppo.py --use_custom_reward --total-timesteps 500000 --model_name catanddog --model_file_name reward_model_catanddog_CartPole_imageSize_224.pth
+
+nohup python ppo.py --use_env_reward --use_custom_reward --total-timesteps 500000 --model_name catanddog --model_file_name reward_model_catanddog_CartPole_imageSize_224.pth > "nohup_$(date +%s).txt" 2>&1 &
+
+nohup python ppo.py --use_custom_reward --total-timesteps 5000 --model_name CatAndDogConvNetCustom --model_file_name reward_model_curated_prefs_sigmoid.pth > "nohup_$(( $(date +%s) + 2 )).txt" 2>&1 &
+'''

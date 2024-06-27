@@ -1,24 +1,24 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
 import os
 import sys
-sys.path.append("/raid/infolab/veerendra/shariq/workdir")
 import random
 import time
 from dataclasses import dataclass
-
+print(os.getcwd())  # /home/.../cleanrl/cleanrl => dir where python run command is called
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchvision import transforms
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
-from catdogmodel import CatAndDogConvNet
+from utils.catdogmodel import CatAndDogConvNet
 # from RlvlmfCNNmodel import gen_image_net
-from utils_train_reward_model import prepocess_image
+from utils.utils_train_reward_model import prepocess_image
 import matplotlib.pyplot as plt
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -91,6 +91,7 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
     use_custom_reward: bool = False
+    use_env_reward: bool = False
     record_every: int = 100
     agent_model_path: str = os.path.join(os.getcwd(), "trained_policies/Agent_CartPole-v0_True_with_env_rewards_50000_1718960761.pth")
 
@@ -99,7 +100,7 @@ def make_env(env_id, idx, capture_video, run_name, record_every):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: x % record_every == 0)
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}/video_{run_time}.mp4", episode_trigger=lambda x: (x+1) % record_every == 0)
         else:
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -142,16 +143,22 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
+def designed_reward_fun(cart_position, pole_angle):
+    max_distance  = 2.4
+    max_angle     = 0.2095
+    return (max_distance - abs(cart_position)) * (max_angle - abs(pole_angle)) / (max_distance * max_angle)
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"trained_{args.env_id}__{args.exp_name}__{args.seed}__{args.use_custom_reward}__with_Env_Rewards__{args.num_steps}__{args.total_timesteps}__{int(time.time())}"
+    run_time = int(time.time())
+    run_name = f"trained_{args.env_id}__{args.exp_name}__{args.seed}__{args.use_custom_reward}__env_rewards_{args.use_env_reward}__{args.num_steps}__{args.total_timesteps}__{run_time}"
 
+    print(f"{args.num_iterations = }")
     # load reward model
-    reward_models_dir = "/raid/infolab/veerendra/shariq/workdir/trained_reward_models/"
+    reward_models_dir = os.path.join(os.getcwd(), 'trained_reward_models')
     env_name_0 = args.env_id.split("-")[0]
     model_path = os.path.join(reward_models_dir, f"reward_model_catanddog_{env_name_0}.pth")
     h, w = 224, 224
@@ -195,7 +202,18 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
+
+    if args.use_custom_reward and args.use_env_reward:
+        args.agent_model_path = os.path.join(os.getcwd(), "trained_policies/Agent_CartPole-v0_True_with_env_rewards_50000_1718960761.pth")
+    elif args.use_custom_reward:
+        args.agent_model_path = os.path.join(os.getcwd(), "trained_policies/Agent_CartPole-v0_True_without_env_rewards_50000_1718963690.pth")
+    else:
+        raise ValueError(f"trained agent policy not found with current configs: use_custom_reward = {args.use_custom_reward}, use_env_reward = {args.use_env_reward}")
+    
     agent.load_state_dict(torch.load(args.agent_model_path))
+    agent.eval()
+    print(f"Using env rewards : {args.use_env_reward}")
+    print(f"Using agent       : {args.agent_model_path}")
     
     # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
@@ -236,6 +254,8 @@ if __name__ == "__main__":
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
+            state = next_obs[0].tolist()
+            designed_reward = designed_reward_fun(state[0], state[2])
 
             #################### get reward from custom reward model  ###########################
             img_b = envs.call('render')
@@ -244,8 +264,17 @@ if __name__ == "__main__":
             # plt.imsave(f"{filename}", img)      # (400, 600, 3)
             # preprocess image
             img = Image.fromarray(img)    # (600, 400) pil image
-            img = prepocess_image(img)    # (3,224,224) tensor image
-            # print(f"{img.shape = } -- preprocessed")
+            # img = prepocess_image(img)    # (3,224,224) tensor image
+            ############## for square image dimensions  ##########################
+            # img = img.resize((500,500))
+            # preprocess = transforms.Compose([
+            #                 transforms.Resize(224),
+            #                 transforms.ToTensor(),
+            #                 transforms.Normalize((0.5,), (0.5,))
+            #             ])
+            # img = preprocess(img)
+            ######################################################################
+            img = transforms.ToTensor()(img)
 
             # from torchvision.transforms import ToPILImage
             # img_tmp = img.cpu()
@@ -260,7 +289,6 @@ if __name__ == "__main__":
                 # custom_reward = -reward_model(img.unsqueeze(0)).view(-1).numpy()
                 custom_reward = torch.nn.Sigmoid()(reward_model(img.unsqueeze(0))).view(-1).numpy() + reward
                 # print(f"output reward model : {custom_reward.shape} {reward_model(img.unsqueeze(0)).view(-1).numpy()} {custom_reward}")
-                # sys.exit()
 
             #####################################################################################
 
@@ -275,6 +303,13 @@ if __name__ == "__main__":
             episode_rewards.append(custom_reward[0])
             # print(reward)
 
+            # save state image with reward value
+            # image_dir = f'state_images/{args.env_id}'
+            # os.system(f'mkdir -p {image_dir}')
+            # filename = f"step_{str(global_step).zfill(5)}_reward_{round(custom_reward[0])}.png"
+            # pil_image.save(filename, 'png')
+
+
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
@@ -285,8 +320,16 @@ if __name__ == "__main__":
                         log_custom_episode_returns.append(sum(episode_rewards))
                         episode_rewards = []
                         count_episodes += 1
-                        print(f"{count_episodes = }")
+                        # print(f"{count_episodes = }")
                         # print(f"\n{iteration}\t{step}\t{info = }")
+            
+            # save state values and reward value
+            # with open(os.path.join(os.getcwd(), f'state_images_{args.env_id}', 'state_image_data.csv'), 'a', newline='') as file:
+            #   csv_writer = csv.writer(file)
+            #   if global_step - args.num_envs == 0:
+            #     csv_writer.writerow(['filename', 'cart_position', 'cart_velocity', 'pole_angle','pole_velocity', 'reward'])
+            #   row = [filename] + state + [custom_reward[0]]
+            #   csv_writer.writerow(row)
         
     envs.close()
     writer.close()
@@ -299,6 +342,7 @@ if __name__ == "__main__":
     print(f"{len(x_values) = }")
     print(f"{len(log_episodic_returns) = }")
     print(f"{log_episodic_returns[:5] = }")
+    print(f"{log_custom_episode_returns[:5] = }")
     # plt.plot(x_values, log_env_rewards, label='env_rewards')
     # plt.plot(x_values, log_custom_rewards, label='custom_rewards')
     from scipy.ndimage.filters import gaussian_filter1d
@@ -316,4 +360,6 @@ if __name__ == "__main__":
     plt.ylabel('Returns')
     plt.title(f"{args.env_id}")
     plt.legend()
-    plt.savefig(f"trained_rewards_plot_custom_reward_{args.use_custom_reward}_with_env_rewards_{args.total_timesteps}_{args.num_steps}.png")
+    plt.savefig(f"trained_policy_rewards_plot_custom_reward_{args.use_custom_reward}_env_rewards_{args.use_env_reward}_{args.total_timesteps}_{args.num_steps}_{run_time}.png")
+
+    print(f"cur time: {time.time()}")
