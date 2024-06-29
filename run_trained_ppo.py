@@ -27,6 +27,7 @@ print(f"\n{device = }")
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
+import csv
 
 @dataclass
 class Args:
@@ -100,7 +101,7 @@ def make_env(env_id, idx, capture_video, run_name, record_every):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}/video_{run_time}.mp4", episode_trigger=lambda x: (x+1) % record_every == 0)
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: (x+1) % record_every == 0)
         else:
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -158,16 +159,16 @@ if __name__ == "__main__":
 
     print(f"{args.num_iterations = }")
     # load reward model
-    reward_models_dir = os.path.join(os.getcwd(), 'trained_reward_models')
-    env_name_0 = args.env_id.split("-")[0]
-    model_path = os.path.join(reward_models_dir, f"reward_model_catanddog_{env_name_0}.pth")
-    h, w = 224, 224
-    if 'rlvlmf' in model_path:
-        reward_model = gen_image_net(image_height=h, image_width=w)
-    else:
-        reward_model = CatAndDogConvNet()
-    reward_model.load_state_dict(torch.load(model_path))
-    reward_model.eval()
+    # reward_models_dir = os.path.join(os.getcwd(), 'trained_reward_models')
+    # env_name_0 = args.env_id.split("-")[0]
+    # model_path = os.path.join(reward_models_dir, f"reward_model_catanddog_{env_name_0}.pth")
+    # h, w = 224, 224
+    # if 'rlvlmf' in model_path:
+    #     reward_model = gen_image_net(image_height=h, image_width=w)
+    # else:
+    #     reward_model = CatAndDogConvNet()
+    # reward_model.load_state_dict(torch.load(model_path))
+    # reward_model.eval()
 
     if args.track:
         import wandb
@@ -207,8 +208,6 @@ if __name__ == "__main__":
         args.agent_model_path = os.path.join(os.getcwd(), "trained_policies/Agent_CartPole-v0_True_with_env_rewards_50000_1718960761.pth")
     elif args.use_custom_reward:
         args.agent_model_path = os.path.join(os.getcwd(), "trained_policies/Agent_CartPole-v0_True_without_env_rewards_50000_1718963690.pth")
-    else:
-        raise ValueError(f"trained agent policy not found with current configs: use_custom_reward = {args.use_custom_reward}, use_env_reward = {args.use_env_reward}")
     
     agent.load_state_dict(torch.load(args.agent_model_path))
     agent.eval()
@@ -260,10 +259,21 @@ if __name__ == "__main__":
             #################### get reward from custom reward model  ###########################
             img_b = envs.call('render')
             img = img_b[0]
-            # filename = f"image_globalstep_{str(global_step).zfill(4)}_envstep_{str(step).zfill(4)}_envid_{0}.png"
-            # plt.imsave(f"{filename}", img)      # (400, 600, 3)
+            # save image of state
+            image_dir = f'replay/{args.env_id}/state_images'
+            os.system(f'mkdir -p {image_dir}')
+            filename = f"{str(global_step).zfill(5)}_{str(step).zfill(3)}.png"
+            plt.imsave(f"{image_dir}/{filename}", img) # (400, 600, 3)
+
+            # save state vector and reward
+            with open(os.path.join(os.getcwd(), f'replay/{args.env_id}/state_values_{args.total_timesteps}_{run_time}.csv'), 'a', newline='') as file:
+                csv_writer = csv.writer(file)
+                if global_step - args.num_envs == 0:
+                    csv_writer.writerow(['filename', 'cart_position', 'cart_velocity', 'pole_angle','pole_velocity', 'reward'])
+                row = [filename] + state + [reward[0]]
+                csv_writer.writerow(row)      
             # preprocess image
-            img = Image.fromarray(img)    # (600, 400) pil image
+            # img = Image.fromarray(img)    # (600, 400) pil image
             # img = prepocess_image(img)    # (3,224,224) tensor image
             ############## for square image dimensions  ##########################
             # img = img.resize((500,500))
@@ -274,7 +284,14 @@ if __name__ == "__main__":
             #             ])
             # img = preprocess(img)
             ######################################################################
-            img = transforms.ToTensor()(img)
+            # img = transforms.ToTensor()(img)
+
+            # img_pil = Image.fromarray(img)    # (600, 400) pil image
+            # img = prepocess_image(img_pil)    # (3,224,224) tensor image
+            # print(f"{img.shape = } -- preprocessed")
+            
+            # img_pil.save(filepath)
+            # print(f"{img_pil.size = }")
 
             # from torchvision.transforms import ToPILImage
             # img_tmp = img.cpu()
@@ -283,19 +300,22 @@ if __name__ == "__main__":
             # print(f"{pil_image.size = }")
 
             # query reward model
-            # print(f"{reward.shape = }")
-            with torch.no_grad():
-                # img = img.to(device)
-                # custom_reward = -reward_model(img.unsqueeze(0)).view(-1).numpy()
-                custom_reward = torch.nn.Sigmoid()(reward_model(img.unsqueeze(0))).view(-1).numpy() + reward
-                # print(f"output reward model : {custom_reward.shape} {reward_model(img.unsqueeze(0)).view(-1).numpy()} {custom_reward}")
-
-            #####################################################################################
-
+            custom_reward = torch.tensor([0.0]).to(device) 
             if args.use_custom_reward:
-                rewards[step] = torch.tensor(custom_reward).to(device).view(-1)  # default: 'reward' instead of 'custom_reward'
-            else:
-                rewards[step] = torch.tensor(reward).to(device).view(-1) # default: 'reward' instead of 'custom_reward'
+                with torch.no_grad():
+                    custom_reward = reward_model(img.unsqueeze(0).to(device))
+                    # if 'sigmoid' in args.model_file_name:
+                    #     custom_reward = (reward_model(img.unsqueeze(0).to(device))).cpu().view(-1).numpy()
+                    # else:
+                    #     custom_reward = torch.nn.Sigmoid()(reward_model(img.unsqueeze(0).to(device))).cpu().view(-1).numpy()
+            
+            env_reward = torch.tensor([0.0]).to(device) 
+            if args.use_env_reward:
+                env_reward = torch.tensor(reward).to(device) 
+            
+            combined_reward = custom_reward + env_reward 
+            
+            rewards[step] = combined_reward.view(-1) # default: 'reward' instead of 'combined_reward'
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
             log_env_rewards.append(reward[0])
