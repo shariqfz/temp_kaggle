@@ -1,6 +1,6 @@
 import torch
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+import tyro
 import random
 random.seed(42)
 torch.manual_seed(42)
@@ -11,6 +11,15 @@ import torch
 from torch import nn as nn
 import numpy as np
 
+@dataclass
+class Args():
+    data_dir: str   = 'preferences/filtered_state_images_CartPole-v1'
+    model_name: str 
+    epochs: int     = 1
+    batch_size: int = 32
+    lr: float       = 2e-5
+
+args = tyro.cli(Args) 
 
 def fanin_init(tensor):
     size = tensor.size()
@@ -245,9 +254,9 @@ class ImageDataset(torch.utils.data.Dataset):
 
         return img1, img2, torch.tensor(label)
 
-batch_size = 32
-epochs = 1
-lr = 2e-5
+# batch_size = 32
+# epochs = 1
+# lr = 2e-5
 dataset = ImageDataset(image_dir=image_dir, file_df = df)
 dataloader = torch.utils.data.DataLoader(dataset = dataset, batch_size=batch_size, shuffle=True )
 
@@ -300,5 +309,5 @@ for epoch in range(1, epochs+1):
 
   epoch_losses.append(avg_loss)
   epoch_accs.append(avg_acc)
-  torch.save(model.state_dict(), f"reward_model_curated_prefs_tanh.pth")
+  torch.save(model.state_dict(), f"{args.model_name}.pth")
   print(f"{pred = }")
